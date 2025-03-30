@@ -5,12 +5,24 @@
 
 # import libraries
 using Plots
+using NLsolve
 using Optim
 using Random
 using Distributions
 using LaTeXStrings
 using Parameters # enable @unpack
 
+# making nlsove easier
+function nls(func, params...; ini=[0.0])
+    if typeof(ini) <: Number
+        r = nlsolve((vout, vin) -> vout[1] = func(vin[1], params...), [ini])
+        v = r.zero[1]
+    else
+        r = nlsolve((vout, vin) -> vout .= func(vin, params...), ini)
+        v = r.zero
+    end
+    return v, r.f_converged
+end
 
 function tauchen(N, rho, sigma, param)
     """
@@ -115,10 +127,14 @@ function setParameters(;
     JJ=10,
     NI=2,
     NH=3,
+    NZ=16,
     mu=3.0,             # risk aversion (=3 baseline)             
     beta=0.96,            # subjective discount factor 
     delta=0.08,            # depreciation
     alpha=0.36,            # capital's share of income
+    zeta = 2.0,
+    c_e = 1.0,
+    c_f = 1.0,
     b=0.0,             # borrowing limit
     NTHETA=4,             # number of discretized states
     rho=0.6,           # first-order autoregressive coefficient
@@ -138,6 +154,9 @@ function setParameters(;
     M = 2.0
     logs, prob, invdist = tauchen(NTHETA, rho, sig, M)
     s = exp.(logs)
+
+    logz, prob_z, inv_z = tauchen(NZ, rho, sig, M)
+    z = exp.(logz)
 
     logh, prob_h, invdist = tauchen(NH, rho, sig, M)
     h = exp.(logh)
@@ -168,7 +187,7 @@ function setParameters(;
     NA2 = 20                                     # grid size for CONTROL
 
     return (JJ=JJ, NI=NI, NH=NH, prob_h=prob_h, mu=mu, beta=beta, delta=delta, alpha=alpha, b=b, NTHETA=NTHETA, s=s, prob=prob, tuition=tuition, prod=prod,
-        NA=NA, NA2=NA2, NS=NS, pi_i=pi_i)
+        NA=NA, NA2=NA2, NS=NS, NZ=NZ, z=z, pi_i=pi_i, zeta=zeta, prob_z=prob_z, inv_z=inv_z, c_e=c_e, c_f=c_f)
 end
 
 function set_prices(param, KL)
@@ -209,6 +228,69 @@ function set_prices(param, KL)
 
     return (r=r, wage=wage, phi=phi, gridk=gridk, gridk2=gridk2)
 
+end
+
+function solve_firm(p, param, prices)
+    @unpack JJ, NI, NA, NZ, NTHETA, NH, NS, NA2, tuition, prod, mu, s, beta, prob, prob_h, prob_z, pi_i, zeta, z, c_f = param
+    @unpack r, wage = prices
+
+    # initialize some variables
+    v_f = zeros(NI, NZ)
+    v_f_new = zeros(NI, NZ)
+    n = zeros(NI, NZ)
+    exit = zeros(NI, NZ)
+
+    err = 10   # error between old policy index and new policy index
+    maxiter = 2000 # maximum number of iteration 
+    iter = 1    # iteration counter
+
+    while (err > 1e-3) & (iter < maxiter)
+
+        # tabulate the utility function such that for zero or negative
+        # consumption utility remains a large negative number so that
+        # such values will never be chosen as utility maximizing
+
+        @inbounds for ii in 1:NI
+                Threads.@threads for iz in 1:NZ
+                    n[ii, iz] = (p[ii]*z[iz]/wage)^(1.0/zeta)
+
+                    vpr = 0.0 # next period's value function given (l,k')
+                    for izp in 1:NZ # expectation of next period's value function
+                        vpr += prob_z[iz, izp]*v_f[ii, izp]
+                    end
+                    vpr = p[ii]*z[iz]*n[ii, iz] - wage/(1.0+zeta)*(n[ii, iz]^(1.0+zeta)) - c_f + vpr/(1.0+r)
+
+                    if vpr < 0.0
+                        v_f_new[ii, iz] = 0.0
+                        exit[ii, iz] = 1.0
+                    else
+                        v_f_new[ii, iz] = vpr
+                        exit[ii, iz] = 0.0
+                    end
+                end
+        end
+        err = maximum(abs.(v_f[:, :] - v_f_new[:, :]))
+        v_f .= v_f_new
+        iter += 1
+    end
+
+
+    if iter == maxiter
+        println("WARNING!! @aiyagari_vfi2.jl VFI (firm): iteration reached max: iter=$iter,e rr=$err")
+    end
+
+    # Return household decisions as a struct
+    return (n=n, exit=exit, v_f=v_f)
+end
+
+function solve_p(p, param, prices)
+    @unpack c_e, inv_z, NI = param
+    n, exit, v_f = solve_firm(p, param, prices)
+    dist = zeros(NI)
+    for ii in 1:NI
+        dist[ii] = sum(inv_z.*v_f[ii, :]) - c_e
+    end
+    return dist
 end
 
 
@@ -452,6 +534,12 @@ function get_Steadystate(param)
         # set prices given K/L
         prices = set_prices(param, KL0)
 
+
+
+        p = nls(solve_p, param, prices, ini=[1.0, 1.0])[1]
+
+        firm_dec = solve_firm(p, param, prices)
+
         # solve household problems for decision rules
         dec = solve_household(param, prices)
 
@@ -463,6 +551,8 @@ function get_Steadystate(param)
         err2 = abs(KL0 - KL1) / abs(KL1)
 
         # UPDATE GUESS AS K0+adj*(K1-K0)
+
+
 
         println([iter, KL0, KL1, err2])
 
