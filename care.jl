@@ -132,9 +132,9 @@ function setParameters(;
     beta=0.96,            # subjective discount factor 
     delta=0.08,            # depreciation
     alpha=0.36,            # capital's share of income
-    zeta = 2.0,
-    c_e = 1.0,
-    c_f = 1.0,
+    zeta=2.0,
+    c_e=1.0,
+    c_f=1.0,
     b=0.0,             # borrowing limit
     NTHETA=4,             # number of discretized states
     rho=0.6,           # first-order autoregressive coefficient
@@ -251,23 +251,23 @@ function solve_firm(p, param, prices)
         # such values will never be chosen as utility maximizing
 
         @inbounds for ii in 1:NI
-                Threads.@threads for iz in 1:NZ
-                    n[ii, iz] = (p[ii]*z[iz]/wage)^(1.0/zeta)
+            Threads.@threads for iz in 1:NZ
+                n[ii, iz] = (p[ii]*z[iz]/wage)^(1.0 / zeta)
 
-                    vpr = 0.0 # next period's value function given (l,k')
-                    for izp in 1:NZ # expectation of next period's value function
-                        vpr += prob_z[iz, izp]*v_f[ii, izp]
-                    end
-                    vpr = p[ii]*z[iz]*n[ii, iz] - wage/(1.0+zeta)*(n[ii, iz]^(1.0+zeta)) - c_f + vpr/(1.0+r)
-
-                    if vpr < 0.0
-                        v_f_new[ii, iz] = 0.0
-                        exit[ii, iz] = 1.0
-                    else
-                        v_f_new[ii, iz] = vpr
-                        exit[ii, iz] = 0.0
-                    end
+                vpr = 0.0 # next period's value function given (l,k')
+                for izp in 1:NZ # expectation of next period's value function
+                    vpr += prob_z[iz, izp] * v_f[ii, izp]
                 end
+                vpr = p[ii]*z[iz]*n[ii, iz] - wage/(1.0 + zeta)*(n[ii, iz]^(1.0 + zeta)) - c_f + vpr/(1.0 + r)
+
+                if vpr < 0.0
+                    v_f_new[ii, iz] = 0.0
+                    exit[ii, iz] = 1.0
+                else
+                    v_f_new[ii, iz] = vpr
+                    exit[ii, iz] = 0.0
+                end
+            end
         end
         err = maximum(abs.(v_f[:, :] - v_f_new[:, :]))
         v_f .= v_f_new
@@ -288,7 +288,7 @@ function solve_p(p, param, prices)
     n, exit, v_f = solve_firm(p, param, prices)
     dist = zeros(NI)
     for ii in 1:NI
-        dist[ii] = sum(inv_z.*v_f[ii, :]) - c_e
+        dist[ii] = sum(inv_z .* v_f[ii, :]) - c_e
     end
     return dist
 end
@@ -510,6 +510,44 @@ function get_distribution(param, dec, prices)
     )
 end
 
+function get_distribution_firm(param, dec, firm_dec, prices)
+    @unpack NI, NZ, prob_z, inv_z = param
+    @unpack exit = firm_dec
+
+    err = 1
+    errTol = 0.00001
+    maxiter = 2000
+    iter = 1
+    mea0 = zeros(NI, NZ)
+
+    while (err > errTol) & (iter < maxiter)
+        mea1 = zeros(NI, NZ)
+        @inbounds for ii in 1:NI
+            for iz in 1:NZ
+                for izp in 1:NZ
+                    mea1[ii, izp] += prob_z[iz, izp]*(1.0 - exit[ii, iz])*(mea0[ii, iz] + inv_z[iz])
+                end
+            end
+        end
+        err = maximum(abs.(mea1[:, :] - mea0[:, :]))
+        mea0 .= mea1
+        iter += 1
+    end
+
+    inc_m_f = zeros(NI, NZ)
+    @inbounds for ii in 1:NI
+        for iz in 1:NZ
+            inc_m_f[ii, iz] = (1.0 - exit[ii, iz])*(mea0[ii, iz] + inv_z[iz])
+        end
+    end
+
+    if iter == maxiter
+        println("WARNING!! @aiyagari_vfi2.jl INVARIANT DIST: iteration reached max: iter=$iter, err=$err")
+    end
+
+    return (inc_m_f=inc_m_f)
+end
+
 
 function get_Steadystate(param)
 
@@ -552,7 +590,9 @@ function get_Steadystate(param)
 
         # UPDATE GUESS AS K0+adj*(K1-K0)
 
+        inc_m_f = get_distribution_firm(param, dec, firm_dec, prices)
 
+        error(inc_m_f)
 
         println([iter, KL0, KL1, err2])
 
